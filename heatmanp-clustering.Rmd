@@ -1,0 +1,168 @@
+---
+title: "heatmap-clustering"
+author: "Harpo"
+date: "11/1/2016"
+output: 
+  html_document: 
+    fig_height: 8
+    fig_width: 12
+    highlight: espresso
+    theme: readable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+suppressMessages(library(caret))
+suppressMessages(library(dplyr))
+suppressMessages(library(doMC))
+suppressMessages(library(randomForest))
+registerDoMC(cores=4)
+```
+```{r}
+setwd("/home/harpo/Dropbox/ongoing-work/git-repos/labeling-datasets/")
+#lees el archivo
+dataset=read.csv(file="./characteristicConnectionVector-full.csv",header=F)
+names(dataset)=c("sp","wp","wnp","snp","ds","dm","dl","ss","sm","sl","class")
+
+
+
+splom(~dataset[,1:10],data=dataset,
+        groups=dataset$class,
+        diag.panel = function(x, ...){
+          yrng <- current.panel.limits()$ylim
+          d <- density(x, na.rm=TRUE)
+          d$y <- with(d, yrng[1] + 0.95 * diff(yrng) * y / max(y) )
+          panel.lines(d)
+          diag.panel.splom(x,...)
+        },cex=0.5,xlab="",ylab="",auto.key = TRUE,cex.labels=0.1,pscales = 0,alpha=0.5,varname.cex=0.8
+  )
+```
+
+Dada una conexion con una unica letra. Los valores para cada uno de los 3 atributos sera 1.
+
+Ejemplo:
+
+**R.R.R.R**
+
+Produciria un vector de  1 para SNP, 1 para DS, y 1 para SS y 0 para todos las demas caracteristicas del heatmap
+
+
+#PCA
+##From WIKIPEDIA:
+Principal component analysis (PCA) is a statistical procedure that uses an orthogonal transformation to convert a set of observations of possibly correlated variables into a set of values of linearly uncorrelated variables called principal components. The number of principal components is less than or equal to the number of original variables. This transformation is defined in such a way that the first principal component has the largest possible variance (that is, accounts for as much of the variability in the data as possible), and each succeeding component in turn has the highest variance possible under the constraint that it is orthogonal to the preceding components. The resulting vectors are an uncorrelated orthogonal basis set. PCA is sensitive to the relative scaling of the original variables.
+
+```{r}
+#pca=prcomp(dataset[,1:ncol(dataset)-1], center = TRUE, scale. = TRUE) 
+#plot(pca$x[,1],pca$x[,2],col=c("red","blue","green"))
+
+pca_caret = preProcess(dataset[,1:ncol(dataset)-1], 
+                   method=c("BoxCox", "center", 
+                            "scale", "pca"))
+
+pca_x <- as.matrix(dataset[,1:ncol(dataset)-1]) %*% pca_caret$rotation
+plot(pca_x,col=c("red","green","black"))
+
+```
+
+# CLUSTERING K-MEANS
+
+In k means clustering, we have the specify the number of clusters we want the data to be grouped into. The algorithm randomly assigns each observation to a cluster, and finds the centroid of each cluster. Then, the algorithm iterates through two steps:
+
+Reassign data points to the cluster whose centroid is closest.
+Calculate new centroid of each cluster.
+These two steps are repeated till the within cluster variation cannot be reduced any further. The within cluster variation is calculated as the sum of the euclidean distance between the data points and their respective cluster centroids.
+
+$$ SS(k)=\sum^{n}_{j=1}\sum^{p}_{i=0}(x_{ij} - x_{kj})^2$$
+
+```{r}
+#library(rattle)
+dataset.stand <- scale(dataset[1:10])
+k.means.fit <- kmeans(dataset.stand, 3) # k = 3
+dataset=cbind(dataset,k.means.fit$cluster)
+names(dataset)[12]="cluster"
+group_by(dataset,cluster,class) %>% summarise(n=n())
+```
+
+#2D representation 
+```{r, eval=FALSE, include=FALSE}
+library(cluster)
+clusplot(dataset.stand, k.means.fit$cluster, main='2D representation of the Cluster solution',
+         color=TRUE, shade=TRUE,
+         labels=0, lines=0)
+```
+
+# Aplicamos Random Forest
+
+## Seleccionamos solo la parte del dataset que esta etiquetado, y lo separamos en train y test (80/20)
+```{r}
+set.seed(1492)
+datasample=filter(dataset,class =='Botnet' | class =='Normal')
+datasample$class=factor(datasample$class)
+trainindex <- createDataPartition(datasample$class, p=0.80, list=F)
+train <- datasample[trainindex, ]
+test <- datasample[-trainindex, ]
+``` 
+
+## Entrenamos un random Forest
+### From WIkipedia
+Random forests or random decision forests[1][2] are an ensemble learning method for classification, regression and other tasks, that operate by constructing a multitude of decision trees at training time and outputting the class that is the mode of the classes (classification) or mean prediction (regression) of the individual trees. Random decision forests correct for decision trees' habit of overfitting to their training set.[3]:587–588
+
+
+### Tree bagging
+
+The training algorithm for random forests applies the general technique of bootstrap aggregating, or bagging, to tree learners. Given a training set $X = x_1, ..., x_n$ with responses $Y = y_1,..., y_n$, bagging repeatedly (B times) selects a random sample with replacement of the training set and fits trees to these samples:
+
+For $b = 1, ..., B:$
+Sample, with replacement, n training examples from $X$, $Y$; call these $Xb$, $Yb$.
+Train a decision or regression tree fb on $Xb$, $Yb$.
+After training, predictions for unseen samples x' can be made by averaging the predictions from all the individual regression trees on x':
+
+$$ {\hat {f}}={\frac {1}{B}}\sum _{b=1}^{B}{\hat {f}}_{b}(x')} {\hat {f}}={\frac {1}{B}}\sum _{b=1}^{B}{\hat {f}}_{b}(x') $$
+
+or by taking the majority vote in the case of decision trees.
+
+This bootstrapping procedure leads to better model performance because it decreases the variance of the model, without increasing the bias. This means that while the predictions of a single tree are highly sensitive to noise in its training set, the average of many trees is not, as long as the trees are not correlated. Simply training many trees on a single training set would give strongly correlated trees (or even the same tree many times, if the training algorithm is deterministic); bootstrap sampling is a way of de-correlating the trees by showing them different training sets.
+
+
+```{r}
+
+# Validation method
+ctrl_fast <- trainControl(method="cv", 
+                     repeats=1,
+                     number=10, 
+                     summaryFunction=twoClassSummary,
+                     verboseIter=F,
+                     classProbs=TRUE,
+                     allowParallel = TRUE)       
+
+# Random Forest
+rfFit <- train(class ~ .,
+               data = train,
+               metric="ROC",
+               method = "rf",
+               trControl = ctrl_fast)
+
+```
+
+## Resultado luego de las 10-fold CV
+```{r}
+rfFit
+```
+
+##Matriz de confusion  para el modelo elegido mediante CV
+```{r}
+rfFit$finalModel
+```
+
+# Resultados en conjunto de test
+Consideramos como botnet todo aquello que tenga una probabilidad >0.7 de pertenecer a la clase botnet
+```{r}
+predsrfprobs=predict(rfFit,test,type='prob')
+predsrf=predsrfprobs
+predsrf=ifelse(predsrfprobs$Botnet >0.7,'Botnet','Normal')
+print(caret::confusionMatrix(predsrf,test$class))
+#pca=prcomp(datasample[,1:ncol(datasample)-1], center = TRUE, scale. = TRUE) 
+#plot(pca$x[,1],pca$x[,2],col=c("red","blue","green"))
+
+```
+
